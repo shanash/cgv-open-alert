@@ -1534,6 +1534,75 @@ def test_block_backoff(fake):
           watcher.waiting_until({"blocked_until": {"0345": "말도안되는값"}}) == {})
 
 
+def test_cgv_interval(fake):
+    """CGV 는 정해진 간격마다만 조회한다. 메가박스는 매 사이클 본다."""
+    print("\n[30] CGV 조회 간격")
+    fake.reset()
+
+    check("기본 간격은 5분", watcher.cgv_interval_minutes({}) == 5)
+    check("설정으로 바꿀 수 있다",
+          watcher.cgv_interval_minutes({"cgv_interval_minutes": 10}) == 10)
+
+    saved_last = watcher._last_cgv_at
+    try:
+        watcher._last_cgv_at = None
+        check("이 프로세스 첫 사이클은 CGV 를 본다", watcher.cgv_due({}))
+        watcher._last_cgv_at = time.monotonic()
+        check("방금 봤으면 건너뛴다", not watcher.cgv_due({}))
+        check("간격이 지나면 다시 본다",
+              watcher.cgv_due({}, now=watcher._last_cgv_at + 301))
+    finally:
+        watcher._last_cgv_at = saved_last
+
+    cgv_t = {"site_no": "0345", "site_nm": "대구", "notify": "date",
+             "watch_date": DFAR}
+    mb_t = {"site_no": "MB7011", "site_nm": "동대구", "notify": "date",
+            "watch_date": DFAR}
+    lst_t = {"notify": "listing", "movie_keyword": "어벤져스"}
+    cfg = config(cgv_t, mb_t, lst_t)
+
+    calls, listing_calls = [], []
+    saved_gate, saved_np = watcher.gate_snapshot, cgv_api.get_now_playing
+    watcher.gate_snapshot = lambda site, dates_only=False: (
+        calls.append(site) or {"dates": [], "screens": {}})
+    cgv_api.get_now_playing = lambda: listing_calls.append(1) or []
+    try:
+        old = {"0345": {"dates": ["20990101"], "screens": {}}}
+        ids = sorted(watcher.target_id(t) for t in cfg["targets"])
+        state = dict(fresh_state(), initialized=True, gates=dict(old),
+                     baselined=list(ids), blocked_sites=[])
+        _m, st = watcher.run_once(cfg, copy.deepcopy(state), dry_run=True,
+                                  skip_cgv=True)
+        check("건너뛰는 사이클에는 메가박스만 조회한다", calls == ["MB7011"], calls)
+        check("예매 목록도 조회하지 않는다", listing_calls == [], listing_calls)
+        check("CGV 지점의 지난 게이트 값은 그대로 둔다",
+              st["gates"].get("0345") == old["0345"], st["gates"])
+        check("CGV 대상의 기준선을 잃지 않는다",
+              sorted(st["baselined"]) == ids, st["baselined"])
+        check("건너뛴 것을 차단으로 치지 않는다", st.get("blocked") is False)
+
+        # 직전 사이클에 403 이었으면 건너뛰는 동안에도 차단으로 남는다.
+        # 풀린 것처럼 적으면 '복구됐다' 헛알림이 나간다.
+        calls.clear()
+        blk = dict(state, blocked=True, blocked_sites=["0345", "예매목록"])
+        _m, st = watcher.run_once(cfg, copy.deepcopy(blk), dry_run=True,
+                                  skip_cgv=True)
+        check("직전 403 은 건너뛰는 동안에도 차단으로 남는다",
+              st.get("blocked") is True
+              and st.get("blocked_sites") == ["0345", "예매목록"],
+              st.get("blocked_sites"))
+
+        # 조회 차례면 평소대로 CGV 도 본다
+        calls.clear()
+        _m, st = watcher.run_once(cfg, copy.deepcopy(state), dry_run=True)
+        check("조회 차례면 CGV 도 본다",
+              sorted(calls) == ["0345", "MB7011"] and listing_calls == [1],
+              (calls, listing_calls))
+    finally:
+        watcher.gate_snapshot = saved_gate
+        cgv_api.get_now_playing = saved_np
+
+
 def main():
     fake = FakeCgv().install()
     try:
@@ -1566,6 +1635,7 @@ def main():
         test_screen_failure_spares_dates(fake)
         test_listing_watch(fake)
         test_block_backoff(fake)
+        test_cgv_interval(fake)
     finally:
         fake.restore()
 

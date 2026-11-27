@@ -77,6 +77,11 @@ DEFAULT_CONFIG = {
     # 계속 두드려봐야 거절만 쌓인다. 2026-11-10 에 CGV 가 7시간 동안
     # 전 주소를 막았는데 그 사이 1만 건 가까이 요청을 보냈다.
     "block_backoff_minutes": 15,
+    # CGV 는 이 간격(분)마다 한 번만 조회한다. 메가박스는 매 사이클 본다.
+    # 1분마다 두드리던 것이 Cloudflare 봇 판정에 보탬이 될 수 있어 줄였다.
+    # Actions 는 실행마다 새 프로세스라, 깨어날 때(5분마다) 첫 사이클은
+    # 항상 CGV 를 본다.
+    "cgv_interval_minutes": 5,
     # CGV 예매 오픈은 주 단위 배치로 주간에 일어난다. 새벽에는 감속해서
     # 불필요한 요청을 줄인다 (그래도 완전히 멈추지는 않는다).
     "quiet_hours": {"start": 1, "end": 7, "slowdown": 10},
@@ -119,6 +124,28 @@ def block_backoff_minutes(cfg):
         return max(0, float(cfg.get("block_backoff_minutes", 15)))
     except (TypeError, ValueError):
         return 15.0
+
+
+def cgv_interval_minutes(cfg):
+    """CGV 조회 간격(분)."""
+    try:
+        return max(0, float(cfg.get("cgv_interval_minutes", 5)))
+    except (TypeError, ValueError):
+        return 5.0
+
+
+# 이 프로세스에서 마지막으로 CGV 를 조회한 시각(time.monotonic). state 에
+# 두지 않는 이유: 5분마다 바뀌는 값을 커밋하면 의미 없는 커밋이 쌓이고,
+# 커밋하지 않으면 다음 실행이 낡은 값을 읽어 어차피 조회하게 된다.
+_last_cgv_at = None
+
+
+def cgv_due(cfg, now=None):
+    """이번 사이클에 CGV 를 조회할 차례인가."""
+    if _last_cgv_at is None:
+        return True
+    now = time.monotonic() if now is None else now
+    return now - _last_cgv_at >= cgv_interval_minutes(cfg) * 60
 
 
 def waiting_until(state, now=None):
@@ -652,8 +679,11 @@ def full_scan_due(cfg, state, now=None):
     return now - prev >= timedelta(minutes=full_scan_minutes(cfg))
 
 
-def run_once(cfg, state, dry_run=False):
-    """1회 점검. (알림 메시지 목록, 갱신된 state) 반환."""
+def run_once(cfg, state, dry_run=False, skip_cgv=False):
+    """1회 점검. (알림 메시지 목록, 갱신된 state) 반환.
+
+    skip_cgv 이면 CGV 대상은 이번 사이클에 조회하지 않고 지난 값을 그대로 둔다.
+    """
     state["run_no"] = state.get("run_no", 0) + 1
     first_run = not state.get("initialized", False)
 
@@ -671,6 +701,9 @@ def run_once(cfg, state, dry_run=False):
     # 거절만 쌓이고, 그 사이 알림이 늦어지는 것도 아니다.
     waiting = waiting_until(state)
     retry_at = {k: v.isoformat(timespec="seconds") for k, v in waiting.items()}
+    # CGV 를 건너뛰는 사이클에서도 직전 차단 기록은 이어간다. 여기서 차단이
+    # 풀린 것처럼 기록하면 '복구됐다' 는 헛알림이 나간다.
+    prev_blocked = set(state.get("blocked_sites") or [])
     backoff_until = (datetime.now(KST)
                      + timedelta(minutes=block_backoff_minutes(cfg)))
     messages = []
@@ -701,6 +734,11 @@ def run_once(cfg, state, dry_run=False):
             playing = None
             log("  예매 목록: 재시도 대기 ({}까지)".format(
                 waiting["예매목록"].strftime("%H:%M")))
+        elif skip_cgv:
+            if "예매목록" in prev_blocked:
+                blocked["예매목록"] = "CGV 조회 간격 대기 (직전 403)"
+            playing = None
+            log("  예매 목록: CGV 조회 간격 대기")
         else:
             try:
                 playing = cgv_api.get_now_playing()
@@ -782,6 +820,14 @@ def run_once(cfg, state, dry_run=False):
             blocked[site_no] = "403 뒤 재시도 대기 중"
             log("  {}: 재시도 대기 ({}까지)".format(
                 label, waiting[site_no].strftime("%H:%M")))
+            if site_no in old_gates:
+                new_gates.setdefault(site_no, old_gates[site_no])
+            continue
+
+        if skip_cgv and not chains.is_megabox(site_no):
+            if site_no in prev_blocked:
+                blocked[site_no] = "CGV 조회 간격 대기 (직전 403)"
+            log("  {}: CGV 조회 간격 대기".format(label))
             if site_no in old_gates:
                 new_gates.setdefault(site_no, old_gates[site_no])
             continue
@@ -1096,7 +1142,11 @@ def cycle(cfg, dry_run):
         except Exception as exc:
             log("봇 명령 처리 실패(무시): {}".format(exc))
 
-    messages, state = run_once(cfg, state, dry_run)
+    global _last_cgv_at
+    skip_cgv = not cgv_due(cfg)
+    messages, state = run_once(cfg, state, dry_run, skip_cgv=skip_cgv)
+    if not skip_cgv:
+        _last_cgv_at = time.monotonic()
     sent = deliver(messages, state, dry_run)
 
     # 여기까지 왔으면 조회가 정상이었다는 뜻이다. 직전에 403으로 막혀
