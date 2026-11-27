@@ -214,13 +214,22 @@ def get_event_list(count):
     list 항목은 {evntNo: '202611241728', evntNm: 제목,
     evntStartDt/evntEndDt: 'YYYY-MM-DD HH:MM:SS', prty, ordtmExpoYn,
     evntLnkUrl(대부분 None), ...}. 최신순이 아니라 prty(운영자 지정 순서) 순이다.
+
+    (목록, totalCount) 를 돌려준다. totalCount 는 응답에 없거나 숫자가
+    아니면 None 이다. 받은 건수가 totalCount 보다 적으면 잘려 온 것이다.
     """
     data = _get("content/event/evt/evt/searchEvtListForPage",
                 sscnsChoiYn="N", expnYn="N", expoChnlCd="01",
                 startRow=0, listCount=count)
     if isinstance(data, dict):
-        return data.get("list") or []
-    return data or []
+        try:
+            total = int(data.get("totalCount"))
+        except (TypeError, ValueError):
+            total = None
+        return data.get("list") or [], total
+    if isinstance(data, list):
+        return data, None
+    return [], None
 
 
 # ---------------------------------------------------------------- 헬퍼

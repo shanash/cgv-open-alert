@@ -17,6 +17,25 @@
     {
       "notify": "listing",
       "movie_keyword": "어벤져스"
+    },
+    {
+      "notify": "listing",
+      "movie_keyword": "어벤져스",
+      "format": "SCREENX"
+    },
+    {
+      "notify": "notice",
+      "movie_keyword": "어벤져스",
+      "keywords": [
+        "예매",
+        "오픈",
+        "IMAX",
+        "아이맥스",
+        "SCREENX",
+        "스크린X",
+        "4DX",
+        "돌비"
+      ]
     }
   ],
   "full_scan_every_minutes": 30,

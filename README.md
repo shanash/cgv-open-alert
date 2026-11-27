@@ -67,6 +67,41 @@
 
 ---
 
+## config.json 에서만 넣는 감시
+
+아래 두 가지는 `/add` 버튼으로는 못 넣는다. `config.json` 의 `targets` 에 직접 적는다.
+`/list`·`/status` 에는 보이고 `/list` 에서 지울 수도 있다.
+
+**예매 목록 감시 (`listing`)** — CGV 전국 예매 목록에 그 영화가 뜨면 알린다.
+`format` 을 적으면 그 특별관 예매 목록만 본다.
+
+```json
+{"notify": "listing", "movie_keyword": "어벤져스"}
+{"notify": "listing", "movie_keyword": "어벤져스", "format": "SCREENX"}
+```
+
+`format` 값: `IMAX`(`아이맥스`), `4DX`, `SCREENX`(`스크린X`), `DOLBY ATMOS`(`돌비`, `돌비애트모스`).
+대소문자·띄어쓰기는 가리지 않는다. 모르는 값이면 그 대상은 건너뛰고 로그만 남긴다.
+
+**공고 감시 (`notice`)** — CGV 이벤트 게시판에 제목에 `movie_keyword` 와
+`keywords` 중 하나가 **둘 다** 들어간 새 글이 올라오면 알린다.
+
+```json
+{"notify": "notice", "movie_keyword": "어벤져스",
+ "keywords": ["예매", "오픈", "IMAX", "아이맥스", "SCREENX", "스크린X", "4DX", "돌비"]}
+```
+
+`movie_keyword` 와 `keywords` 가 둘 다 비어 있으면 모든 글이 걸리므로 그 대상은 건너뛴다.
+
+한계:
+
+- **어느 극장인지는 모른다.** 전국 목록과 게시판이라 지점 정보가 없다
+- **게시판 밖 공고는 못 잡는다.** 앱 팝업, 뉴스, SNS 로만 나온 공고는 모른다
+- **처음 넣은 뒤 첫 실행은 조용하다.** 그때 이미 있던 영화·글은 기준선으로만 저장한다
+- **PC 설정 창(`setup_gui.py`)은 이 대상을 못 읽는다.** 지점이 없는 대상이라 창이 멈춘다
+
+---
+
 ## 뭔가 이상할 때
 
 **알림이 안 온다**

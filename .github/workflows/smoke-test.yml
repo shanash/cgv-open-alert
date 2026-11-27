@@ -50,6 +50,27 @@ jobs:
           tryit(f"4 대구 시간표 {TODAY}", lambda: cgv_api.get_schedules(DAEGU, TODAY))
           tryit(f"5 대구 시간표 {TARGET}", lambda: cgv_api.get_schedules(DAEGU, TARGET))
 
+          # 6-8 은 200 여부만이 아니라 내용도 찍는다. 필터가 실제로 걸리는지,
+          # 공고 목록이 잘려 오는지는 건수로만 알 수 있다.
+          full = tryit("6 전체 예매 목록", cgv_api.get_now_playing)
+          if full is not None:
+              print(f"{'':30} 건수 {len(full)}")
+          scx = tryit("7 SCREENX(08) 예매 목록",
+                      lambda: cgv_api.get_format_listing("08"))
+          if scx is not None:
+              print(f"{'':30} 건수 {len(scx)}")
+              if full is not None:
+                  full_nos = {m.get("movNo") for m in full}
+                  scx_nos = {m.get("movNo") for m in scx}
+                  print(f"{'':30} 전체의 진부분집합 {scx_nos < full_nos}")
+          ev = tryit("8 공고 목록 300건", lambda: cgv_api.get_event_list(300))
+          if ev is not None:
+              posts, total = ev
+              print(f"{'':30} 받은 건수 {len(posts)} / totalCount {total}")
+              for p in posts:
+                  if "어벤져스" in str(p.get("evntNm") or ""):
+                      print(f"{'':30} 어벤져스 글: {p.get('evntNo')} {p.get('evntNm')}")
+
           print("\n확인 끝. 사실만 기록하고 실패로 끝내지 않는다.")
           PY
 

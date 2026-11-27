@@ -327,6 +327,9 @@ def test_prune():
     check("스캔한 지점에서 사라진 영화 키는 버린다", "M|0345|M9" not in kept, kept)
     check("살아있는 영화 키는 남긴다", "M|0345|M1" in kept, kept)
     check("스캔 안 한 지점의 영화 키는 건드리지 않는다", "M|0128|M7" in kept, kept)
+    kept = watcher.prune_seen({"N|202611241728", "L2|08|x"})
+    check("공고 키와 특별관 목록 키는 남긴다  <- 지우면 같은 글·영화를 다시 알린다",
+          kept == {"N|202611241728", "L2|08|x"}, kept)
 
 
 def test_merge():
@@ -358,6 +361,9 @@ def test_merge():
     m = merge_state.merge({"seen": [new_key]}, {"seen": [old_key, new_key]})
     check("오래된 회차 키는 병합에서도 버린다  <- 되살아나면 state 가 계속 큰다",
           m["seen"] == [new_key], m["seen"])
+    m = merge_state.merge({"seen": ["N|202611241728"]}, {"seen": ["L2|08|x"]})
+    check("공고 키와 특별관 목록 키는 병합 뒤에도 남는다",
+          m["seen"] == ["L2|08|x", "N|202611241728"], m["seen"])
 
     check("config 에서 감시 대상 id 를 읽어낸다",
           merge_state.valid_target_ids("config.json")
@@ -1602,6 +1608,35 @@ def test_cgv_interval(fake):
         watcher.gate_snapshot = saved_gate
         cgv_api.get_now_playing = saved_np
 
+    # 공고·특별관 목록 대상도 건너뛰는 주기에는 조회하지 않는다
+    ntc_t = {"notify": "notice", "movie_keyword": "어벤져스", "keywords": ["예매"]}
+    scx_t = {"notify": "listing", "movie_keyword": "어벤져스", "format": "SCREENX"}
+    cfg_n = config(ntc_t, scx_t)
+    other_calls = []
+    saved_ev = (cgv_api.get_event_list, cgv_api.get_format_listing)
+    cgv_api.get_event_list = lambda count: other_calls.append(("공고", count)) \
+        or ([], None)
+    cgv_api.get_format_listing = lambda attr: other_calls.append(("형식", attr)) \
+        or []
+    try:
+        ids_n = sorted(watcher.target_id(t) for t in cfg_n["targets"])
+        st_n = dict(fresh_state(), initialized=True, baselined=list(ids_n),
+                    blocked_sites=[])
+        _m, st = watcher.run_once(cfg_n, copy.deepcopy(st_n), dry_run=True,
+                                  skip_cgv=True)
+        check("건너뛰는 사이클에는 공고·특별관 목록도 조회하지 않는다",
+              other_calls == [], other_calls)
+        check("공고 대상의 기준선을 잃지 않는다",
+              sorted(st["baselined"]) == ids_n, st["baselined"])
+        blk_n = dict(st_n, blocked=True, blocked_sites=["공고"])
+        _m, st = watcher.run_once(cfg_n, copy.deepcopy(blk_n), dry_run=True,
+                                  skip_cgv=True)
+        check("직전 '공고' 403 은 건너뛰는 동안에도 차단으로 남는다",
+              st.get("blocked") is True and st.get("blocked_sites") == ["공고"],
+              st.get("blocked_sites"))
+    finally:
+        cgv_api.get_event_list, cgv_api.get_format_listing = saved_ev
+
 
 def test_format_listing(fake):
     """특별관(SCREENX 등) 예매 목록에 영화가 새로 뜨면 알린다."""
@@ -1642,6 +1677,23 @@ def test_format_listing(fake):
           watcher.listing_key("30001790", "어벤져스", "08") == "L2|08|30001790")
     check("prune_seen 이 특별관 목록 키를 남긴다",
           "L2|08|x" in watcher.prune_seen({"L2|08|x", "L2|y"}))
+    # ---- 문구
+    check("형식 없는 대상 문구는 예전 그대로",
+          watcher.describe(plain_nosite) == "CGV 예매 목록에 '어벤져스' 뜨면",
+          watcher.describe(plain_nosite))
+    check("SCREENX 대상 문구에 형식 이름이 들어간다",
+          watcher.describe(scx) == "CGV SCREENX 예매 목록에 '어벤져스' 뜨면",
+          watcher.describe(scx))
+    check("모르는 형식은 적은 값 그대로 보여준다",
+          watcher.describe(odd) == "CGV 울트라 4K 예매 목록에 '어벤져스' 뜨면",
+          watcher.describe(odd))
+    lm = watcher.build_listing_message("어벤져스: 둠스데이", "2.1", "SCREENX")
+    check("특별관 알림 제목에 형식이 들어간다",
+          "CGV SCREENX 예매 목록에 떴습니다" in lm
+          and "SCREENX 예매가 열렸다" in lm, lm)
+    lm0 = watcher.build_listing_message("어벤져스: 둠스데이", "2.1")
+    check("형식 없는 알림 제목은 예전 그대로",
+          "CGV 예매 목록에 떴습니다" in lm0 and "<b>예매가 열렸다</b>" in lm0, lm0)
     check("notice 단위를 그대로 돌려준다",
           watcher.granularity_of({"notify": "notice"}) == "notice")
     check("notice id 에 정렬·정규화한 keywords 가 붙는다",
@@ -1705,6 +1757,9 @@ def test_format_listing(fake):
               msgs and "어벤져스: 둠스데이" in msgs[0][0], msgs and msgs[0][0])
         check("알림 키는 L2|08|movNo",
               msgs and msgs[0][1] == ["L2|08|9"], msgs and msgs[0][1])
+        check("알림 제목에 SCREENX 가 들어간다",
+              msgs and "CGV SCREENX 예매 목록에 떴습니다" in msgs[0][0],
+              msgs and msgs[0][0])
         check("알림 주기에만 전체 목록을 1건 부른다", counts() == (1, 1))
         msgs, st = run(cfg, st)
         check("두 번 알리지 않는다", not msgs, msgs)
@@ -1815,6 +1870,290 @@ def test_format_listing(fake):
         cgv_api.get_now_playing, cgv_api.get_format_listing = saved
 
 
+def test_notice_watch(fake):
+    """CGV 이벤트 게시판에 조건에 맞는 공고가 새로 올라오면 알린다."""
+    print("\n[32] 공고 감시")
+    fake.reset()
+
+    # ---- 도우미
+    check("keywords 가 목록이면 그대로",
+          watcher.keywords_of({"keywords": ["예매", "IMAX"]}) == ["예매", "IMAX"])
+    check("keywords 가 문자열이면 한 항목",
+          watcher.keywords_of({"keywords": "예매"}) == ["예매"])
+    check("keywords 가 없거나 이상한 값이면 빈 목록",
+          watcher.keywords_of({}) == [] and watcher.keywords_of({"keywords": 3}) == []
+          and watcher.keywords_of({"keywords": ["", None]}) == [])
+    str_id = watcher.target_id({"notify": "notice", "movie_keyword": "어벤져스",
+                                "keywords": "예매오픈"})
+    check("문자열 keywords 의 id 가 글자 단위로 쪼개지지 않는다",
+          str_id.endswith("|notice|예매오픈"), str_id)
+    check("목록 keywords 의 id 는 예전 모양 그대로",
+          watcher.target_id({"notify": "notice", "movie_keyword": "어벤져스",
+                             "keywords": ["예매 오픈", "SCREENX"]})
+          .endswith("|notice|screenx,예매오픈"))
+    check("notice_key 는 N|evntNo",
+          watcher.notice_key({"evntNo": "202611241728"}) == "N|202611241728")
+    check("글 번호가 없으면 키 없음", watcher.notice_key({"evntNm": "x"}) is None)
+
+    fb = watcher.NOTICE_FALLBACK_URL
+    nu = watcher.notice_url
+    check("상대 경로에는 cgv.co.kr 을 붙인다",
+          nu({"evntLnkUrl": "/evt/123"}) == "https://cgv.co.kr/evt/123",
+          nu({"evntLnkUrl": "/evt/123"}))
+    check("cgv 절대 주소는 그대로",
+          nu({"evntLnkUrl": "https://m.cgv.co.kr/e?id=1"})
+          == "https://m.cgv.co.kr/e?id=1")
+    check("외부 주소는 대체 주소로",
+          nu({"evntLnkUrl": "https://evil.example/cgv.co.kr"}) == fb
+          and nu({"evntLnkUrl": "https://cgv.co.kr.evil.example/"}) == fb
+          and nu({"evntLnkUrl": "//evil.example/x"}) == fb
+          and nu({"evntLnkUrl": "http://cgv.co.kr/x"}) == fb
+          and nu({"evntLnkUrl": "https://cgv.co.kr@evil.example/"}) == fb)
+    check("주소가 없으면 대체 주소로",
+          nu({"evntLnkUrl": None}) == fb and nu({}) == fb)
+    check("공백·제어문자가 든 주소는 대체 주소로",
+          nu({"evntLnkUrl": "https://cgv.co.kr/a b"}) == fb
+          and nu({"evntLnkUrl": "/a\nb"}) == fb)
+
+    post = {"evntNo": "1", "evntNm": "<어벤져스> 예매 오픈 & 굿즈",
+            "evntStartDt": "2026-11-28 10:00:00",
+            "evntEndDt": "2026-12-31 23:59:59", "evntLnkUrl": None}
+    text = watcher.build_notice_message(post)
+    check("공고 제목은 escape 한다",
+          "&lt;어벤져스&gt; 예매 오픈 &amp; 굿즈" in text, text)
+    check("공고 기간이 들어간다", "2026-11-28 ~ 2026-12-31" in text, text)
+    check("대체 주소면 제목으로 찾으라고 적는다", "제목으로 찾으세요" in text, text)
+    text2 = watcher.build_notice_message(
+        dict(post, evntStartDt=None, evntEndDt=None, evntLnkUrl="/e/1"))
+    check("기간이 없으면 생략하고 글 주소를 쓴다",
+          "기간" not in text2 and "https://cgv.co.kr/e/1" in text2
+          and "제목으로 찾으세요" not in text2, text2)
+
+    # ---- 문구
+    check("공고 대상 문구",
+          watcher.describe({"notify": "notice", "movie_keyword": "어벤져스",
+                            "keywords": ["예매", "IMAX"]})
+          == "CGV 공고에 '어벤져스' (예매/IMAX) 뜨면")
+    check("키워드가 없으면 괄호를 뺀다",
+          watcher.describe({"notify": "notice", "movie_keyword": "어벤져스"})
+          == "CGV 공고에 '어벤져스' 뜨면")
+    saved_load = watcher.load_config
+    watcher.load_config = lambda: config(
+        {"notify": "notice", "movie_keyword": "어벤져스", "keywords": ["예매"]},
+        {"notify": "listing", "movie_keyword": "어벤져스", "format": "SCREENX"},
+        {"notify": "listing", "movie_keyword": "어벤져스"})
+    try:
+        summary = watcher.check_summary()
+        ok = True
+    except Exception as exc:   # noqa: BLE001
+        summary, ok = repr(exc), False
+    finally:
+        watcher.load_config = saved_load
+    check("/check 가 공고·특별관 목록 대상에서 죽지 않는다", ok, summary)
+    check("/check 는 공고를 조회하지 않는다고 적는다",
+          "CGV 공고에 '어벤져스' (예매) 뜨면 — CGV 이벤트 게시판 (여기서는 조회하지 않음)"
+          in summary and "CGV SCREENX 예매 목록에 '어벤져스' 뜨면" in summary,
+          summary)
+
+    # ---- run_once
+    def evt(no, nm, url=None):
+        return {"evntNo": no, "evntNm": nm, "evntStartDt": "2026-11-28 10:00:00",
+                "evntEndDt": "2026-12-31 23:59:59", "evntLnkUrl": url}
+
+    words = ["예매", "오픈", "IMAX", "아이맥스", "SCREENX", "스크린X", "4DX", "돌비"]
+    ntc = {"notify": "notice", "movie_keyword": "어벤져스", "keywords": words}
+    posts = [evt("100", "듄-파트 3 IMAX 예매 오픈 이벤트"),
+             evt("101", "어벤져스 굿즈 증정")]
+    total = [None]
+    calls = []
+    errors = []          # 차례대로 던질 예외. None 이면 정상 응답.
+
+    def fake_events(count):
+        calls.append(count)
+        if errors:
+            exc = errors.pop(0)
+            if exc is not None:
+                raise exc
+        return list(posts), total[0]
+
+    def taken():
+        out = list(calls)
+        calls.clear()
+        return out
+
+    saved = (cgv_api.get_event_list, cgv_api.get_now_playing,
+             cgv_api.get_format_listing)
+    cgv_api.get_event_list = fake_events
+    try:
+        cfg = config(ntc)
+        msgs, st = run(cfg, fresh_state())
+        check("기준선 주기에는 알리지 않는다", not msgs, msgs)
+        check("공고 목록은 300건으로 1번 부른다", taken() == [300])
+        check("기준선 주기 뒤 대상 기준선이 잡힌다",
+              watcher.target_id(ntc) in st["baselined"], st["baselined"])
+
+        # 기준선 주기에 이미 있던 맞는 글은 기준선으로만 들어간다
+        posts.append(evt("102", "어벤져스: 둠스데이 IMAX 예매 오픈", "/evt/102"))
+        msgs, st_b = run(cfg, fresh_state())
+        check("기준선 주기에 있던 맞는 글은 알리지 않고 seen 에 넣는다",
+              not msgs and "N|102" in st_b["seen"], (msgs, st_b["seen"]))
+        posts.pop()
+        taken()
+
+        msgs, st = run(cfg, st)
+        check("변화 없으면 조용하다", not msgs, msgs)
+        taken()
+
+        posts.append(evt("200", "<어벤져스: 둠스데이> SCREENX 예매 오픈",
+                         "/event/200"))
+        msgs, st = run(cfg, st)
+        check("새 공고가 뜨면 한 번 알린다", len(msgs) == 1, msgs)
+        check("알림 키는 N|evntNo", msgs and msgs[0][1] == ["N|200"],
+              msgs and msgs[0][1])
+        check("알림에 제목과 링크가 들어간다",
+              msgs and "&lt;어벤져스: 둠스데이&gt;" in msgs[0][0]
+              and "https://cgv.co.kr/event/200" in msgs[0][0],
+              msgs and msgs[0][0])
+        check("버튼은 공고 주소",
+              msgs and msgs[0][2][0][0]["url"] == "https://cgv.co.kr/event/200",
+              msgs and msgs[0][2])
+        taken()
+        msgs, st = run(cfg, st)
+        check("두 번 알리지 않는다", not msgs, msgs)
+        taken()
+
+        posts.append(evt("201", "어벤져스 팝업스토어 안내"))
+        posts.append(evt("202", "위키드 IMAX 예매 오픈"))
+        msgs, st = run(cfg, st)
+        check("어벤져스만 있거나 키워드만 있는 글은 조용하다", not msgs, msgs)
+        taken()
+
+        # 키워드가 둘 다 빈 대상은 조회도 기준선도 없다
+        empty = {"notify": "notice", "movie_keyword": "", "keywords": []}
+        msgs, st_e = run(config(empty), fresh_state())
+        check("빈 키워드 대상은 조회하지 않는다", taken() == [])
+        check("빈 키워드 대상은 기준선도 잡지 않는다",
+              watcher.target_id(empty) not in st_e.get("baselined", []),
+              st_e.get("baselined"))
+
+        # 대상 둘이 같은 글을 맞추면 메시지 1건
+        ntc2 = {"notify": "notice", "movie_keyword": "둠스데이",
+                "keywords": ["예매"]}
+        two = config(ntc, ntc2)
+        st2 = dict(copy.deepcopy(st), baselined=[watcher.target_id(t)
+                                                 for t in two["targets"]])
+        posts.append(evt("203", "어벤져스: 둠스데이 4DX 예매 오픈"))
+        msgs, st2 = run(two, st2)
+        check("두 대상이 같은 글을 맞추면 한 번만 알린다",
+              len(msgs) == 1 and msgs[0][1] == ["N|203"], msgs)
+        check("대상이 둘이어도 공고 목록은 1번만 부른다", taken() == [300])
+        posts.pop()          # st 는 이 글을 본 적이 없다
+
+        # 앞쪽 새 대상의 기준선이 뒤쪽 기존 대상의 새 글을 삼키지 않는다
+        late = config(ntc2, ntc)
+        st_l = dict(copy.deepcopy(st), baselined=[watcher.target_id(ntc)])
+        posts.append(evt("205", "어벤져스: 둠스데이 IMAX 예매 오픈"))
+        msgs, st_l = run(late, st_l)
+        check("새 대상이 앞에 있어도 기존 대상의 새 공고는 알린다",
+              len(msgs) == 1 and msgs[0][1] == ["N|205"], msgs)
+        check("새 대상도 기준선이 잡힌다",
+              watcher.target_id(ntc2) in st_l["baselined"], st_l["baselined"])
+        posts.pop()
+        taken()
+
+        # 403: 백오프, 차단 기록, 다음 주기(대기 중) 조회 없음
+        posts.append(evt("204", "어벤져스 IMAX 예매 오픈 안내"))
+        errors[:] = [cgv_api.CloudflareBlocked("403 Forbidden: 공고")]
+        msgs, st3 = run(cfg, copy.deepcopy(st))
+        check("403 이면 공고 알림이 없다",
+              not [m for m in msgs if m[1]], msgs)
+        check("403 이면 40건으로 다시 부르지 않는다", taken() == [300])
+        check("'공고' 백오프가 적힌다",
+              "공고" in (st3.get("blocked_until") or {}),
+              st3.get("blocked_until"))
+        check("403 은 차단으로 기록된다",
+              st3.get("blocked") is True and "공고" in st3.get("blocked_sites", []),
+              st3.get("blocked_sites"))
+        msgs, st3 = run(cfg, st3)
+        check("대기 중에는 공고 목록을 부르지 않는다", taken() == [])
+        check("대기 중에도 차단으로 남는다",
+              "공고" in st3.get("blocked_sites", []), st3.get("blocked_sites"))
+        st3["blocked_until"] = {}
+        msgs, st3 = run(cfg, st3)
+        check("대기가 풀리면 다시 부르고 놓친 글을 알린다",
+              taken() == [300] and len(msgs) == 1 and msgs[0][1] == ["N|204"],
+              msgs)
+        check("다시 받으면 '공고' 백오프가 지워진다",
+              "공고" not in (st3.get("blocked_until") or {}),
+              st3.get("blocked_until"))
+        posts.pop()
+
+        # 403 아닌 실패: 40건으로 한 번 더
+        errors[:] = [cgv_api.CgvError("searchEvtListForPage: 너무 많음"), None]
+        posts.append(evt("205", "어벤져스 돌비 예매 오픈"))
+        msgs, st4 = run(cfg, copy.deepcopy(st))
+        check("CgvError 면 40건으로 한 번 더 부른다", taken() == [300, 40])
+        check("다시 받은 목록으로 알린다",
+              len(msgs) == 1 and msgs[0][1] == ["N|205"], msgs)
+        check("CgvError 는 차단으로 치지 않는다",
+              "공고" not in (st4.get("blocked_until") or {})
+              and st4.get("blocked") is False, st4.get("blocked_until"))
+        posts.pop()
+
+        errors[:] = [cgv_api.CgvError("오류 1"), cgv_api.CgvError("오류 2")]
+        msgs, st5 = run(cfg, fresh_state())
+        check("둘 다 실패하면 더 부르지 않는다", taken() == [300, 40])
+        check("둘 다 실패하면 새 대상 기준선을 잡지 않는다",
+              watcher.target_id(ntc) not in st5.get("baselined", []),
+              st5.get("baselined"))
+
+        errors[:] = [cgv_api.CgvError("오류"),
+                     cgv_api.CloudflareBlocked("403 Forbidden: 공고")]
+        msgs, st6 = run(cfg, copy.deepcopy(st))
+        check("다시 부른 40건이 403 이면 '공고' 백오프",
+              taken() == [300, 40]
+              and "공고" in (st6.get("blocked_until") or {}),
+              st6.get("blocked_until"))
+        errors.clear()
+
+        # 잘린 응답도 받은 것으로 처리한다
+        total[0] = 500
+        posts.append(evt("206", "어벤져스 스크린X 예매 오픈"))
+        msgs, st7 = run(cfg, copy.deepcopy(st))
+        check("잘린 응답(받은 수 < totalCount)도 처리된다",
+              len(msgs) == 1 and msgs[0][1] == ["N|206"], msgs)
+        posts.pop()
+        total[0] = None
+        taken()
+
+        # skip_cgv 면 조회하지 않는다
+        _m, _st = watcher.run_once(cfg, copy.deepcopy(st), dry_run=True,
+                                   skip_cgv=True)
+        check("CGV 를 건너뛰는 주기에는 공고 목록도 부르지 않는다",
+              taken() == [])
+
+        # notice + listing + 지점 대상이 섞여도 끝난다
+        cgv_api.get_now_playing = lambda: []
+        cgv_api.get_format_listing = lambda attr: []
+        mixed = config(ntc,
+                       {"notify": "listing", "movie_keyword": "어벤져스"},
+                       {"notify": "listing", "movie_keyword": "어벤져스",
+                        "format": "SCREENX"},
+                       target(site="0345", notify="date"))
+        fake.set("0345", DFAR, [row("0345", "M1", "오디세이", DFAR, "1000")])
+        try:
+            msgs, st8 = run(mixed, fresh_state())
+            ok = True
+        except Exception as exc:   # noqa: BLE001
+            ok = repr(exc)
+        check("공고·예매 목록·지점 대상이 섞여도 run_once 가 끝난다", ok is True, ok)
+        check("섞인 설정에서도 공고 목록은 1번",
+              taken() == [300])
+    finally:
+        (cgv_api.get_event_list, cgv_api.get_now_playing,
+         cgv_api.get_format_listing) = saved
+
+
 def main():
     fake = FakeCgv().install()
     try:
@@ -1849,6 +2188,7 @@ def main():
         test_block_backoff(fake)
         test_cgv_interval(fake)
         test_format_listing(fake)
+        test_notice_watch(fake)
     finally:
         fake.restore()
 

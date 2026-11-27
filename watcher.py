@@ -80,6 +80,15 @@ LISTING_FORMAT_NAMES = {
     "04": "IMAX", "03": "4DX", "08": "SCREENX", "06": "DOLBY ATMOS",
 }
 
+# 공고(이벤트 게시판) 감시. 목록이 최신순이 아니라 운영자 지정 순서라
+# 앞쪽만 보면 새 글을 놓친다. 한 번에 넉넉히 받는다 (2026-11 기준 235건).
+NOTICE_COUNT = 300
+# 300 이 403 아닌 오류로 거절되면 이 건수로 한 번만 다시 받는다 (실측된 값).
+NOTICE_FALLBACK_COUNT = 40
+# 글 주소를 믿을 수 없을 때 보내는 곳. 텔레그램은 버튼 URL 이 이상하면
+# 전송을 거절하고, 그러면 사이클 전체가 저장 없이 끝난다.
+NOTICE_FALLBACK_URL = "https://cgv.co.kr"
+
 DEFAULT_CONFIG = {
     "targets": [],
     "full_scan_every_minutes": 30,
@@ -257,6 +266,21 @@ def format_of(target):
     return LISTING_FORMATS.get(key, "?" + key)
 
 
+def keywords_of(target):
+    """공고 대상의 keywords 를 목록으로. 예외를 던지면 안 된다.
+
+    문자열 하나로 적어도 받아준다. 그대로 돌면 글자 단위로 쪼개져서
+    '예매' 가 '예' 와 '매' 두 키워드가 된다. merge_state 가 target_id 를
+    거쳐 이 함수를 부른다.
+    """
+    raw = target.get("keywords")
+    if isinstance(raw, str):
+        return [raw] if raw else []
+    if isinstance(raw, (list, tuple)):
+        return [str(k) for k in raw if k not in (None, "") and str(k)]
+    return []
+
+
 def watch_dates_of(target):
     """date 대상이 노리는 날짜들. 비어 있으면 '새로 열리는 날짜 전부'."""
     raw = target.get("watch_date") or target.get("watch_dates") or []
@@ -284,14 +308,26 @@ def target_id(target):
             base += "|" + attr
     elif granularity_of(target) == "notice":
         base += "|" + ",".join(sorted(
-            normalize(k) for k in (target.get("keywords") or [])))
+            normalize(k) for k in keywords_of(target)))
     return base
 
 
 def describe(target):
+    if granularity_of(target) == "notice":
+        words = keywords_of(target)
+        return "CGV 공고에 '{}'{} 뜨면".format(
+            target.get("movie_keyword", "") or "새 글",
+            " ({})".format("/".join(words)) if words else "")
     if granularity_of(target) == "listing":
-        return "CGV 예매 목록에 '{}' 뜨면".format(
-            target.get("movie_keyword", "") or "새 영화")
+        attr = format_of(target)
+        if attr is None:
+            where = "CGV 예매 목록"
+        else:
+            # 모르는 형식은 사용자가 적은 값을 그대로 보여준다.
+            where = "CGV {} 예매 목록".format(
+                LISTING_FORMAT_NAMES.get(attr) or target.get("format"))
+        return "{}에 '{}' 뜨면".format(
+            where, target.get("movie_keyword", "") or "새 영화")
     if granularity_of(target) == "screen":
         scr = screen_of(target)
         return "{} {}".format(
@@ -436,6 +472,45 @@ def listing_key(mov_no, mov_nm, attr=None):
     return "L2|{}".format(mov_no or normalize(mov_nm))
 
 
+def notice_key(post):
+    """공고 키. 'N|<evntNo>'. 글 번호가 없으면 None (그 글은 건너뛴다).
+
+    3조각이 아니고 'D|' 도 아니라 prune_seen 이 지우지 않는다.
+    """
+    no = post.get("evntNo")
+    if no in (None, ""):
+        return None
+    return "N|" + str(no)
+
+
+def notice_url(post):
+    """공고 알림 버튼에 넣을 주소. 믿을 수 없으면 NOTICE_FALLBACK_URL.
+
+    '/' 로 시작하는 상대 경로는 cgv.co.kr 을 붙이고, https 이며 호스트가
+    cgv.co.kr 또는 그 하위 도메인인 주소만 그대로 쓴다. 외부 주소는 버튼에
+    넣지 않는다.
+    """
+    raw = post.get("evntLnkUrl")
+    if not isinstance(raw, str) or not raw:
+        return NOTICE_FALLBACK_URL
+    if any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in raw):
+        return NOTICE_FALLBACK_URL
+    if raw.startswith("/") and not raw.startswith("//"):
+        raw = NOTICE_FALLBACK_URL + raw
+    try:
+        parts = urllib.parse.urlsplit(raw)
+        host = parts.hostname or ""
+        port = parts.port
+    except ValueError:
+        return NOTICE_FALLBACK_URL
+    if parts.scheme != "https" or parts.username or parts.password \
+            or port not in (None, 443):
+        return NOTICE_FALLBACK_URL
+    if host == "cgv.co.kr" or host.endswith(".cgv.co.kr"):
+        return raw
+    return NOTICE_FALLBACK_URL
+
+
 def is_upcoming(movie):
     """예매 목록의 영화가 아직 예매 전(개봉예정)인지.
 
@@ -570,15 +645,18 @@ def _fmt_count(value):
     return "{}편".format(value) if str(value).isdigit() else str(value)
 
 
-def build_listing_message(mov_nm, rate=None):
+def build_listing_message(mov_nm, rate=None, fmt_name=None):
     """CGV 예매 목록(예매율 순)에 그 영화가 올라왔다는 알림.
 
     지점은 알 수 없다. 전국 목록이기 때문이다. 하지만 '예매가 열렸다'는
-    사실 자체를 제목으로 확인해주는 유일한 신호다.
+    사실 자체를 제목으로 확인해주는 유일한 신호다. fmt_name 이 있으면
+    특별관(SCREENX 등) 목록에 뜬 것이다.
     """
     esc = html.escape
+    where = "CGV {} 예매 목록".format(esc(fmt_name)) if fmt_name else "CGV 예매 목록"
+    what = "{} 예매".format(esc(fmt_name)) if fmt_name else "예매"
     lines = [
-        "\U0001F39F <b>CGV 예매 목록에 떴습니다!</b>",
+        "\U0001F39F <b>{}에 떴습니다!</b>".format(where),
         "",
         "  <b>{}</b>".format(esc(mov_nm)),
     ]
@@ -586,11 +664,31 @@ def build_listing_message(mov_nm, rate=None):
         lines.append("  예매율 {}".format(esc(str(rate))))
     lines += [
         "",
-        "CGV 어딘가에서 <b>예매가 열렸다</b>는 뜻입니다. "
+        "CGV 어딘가에서 <b>{}가 열렸다</b>는 뜻입니다. ".format(what) +
         "어느 지점인지는 이 알림으로 알 수 없습니다. 바로 확인하세요.",
         "",
         esc(BOOK_URL),
     ]
+    return "\n".join(lines)
+
+
+def build_notice_message(post):
+    """CGV 이벤트 게시판에 조건에 맞는 공고가 올라왔다는 알림."""
+    esc = html.escape
+    lines = [
+        "\U0001F4E2 <b>CGV 공고가 올라왔습니다</b>",
+        "",
+        "  <b>{}</b>".format(esc(str(post.get("evntNm") or ""))),
+    ]
+    start = str(post.get("evntStartDt") or "")[:10]
+    end = str(post.get("evntEndDt") or "")[:10]
+    if start or end:
+        lines.append("  기간 {} ~ {}".format(esc(start), esc(end)))
+    url = notice_url(post)
+    lines += ["", esc(url)]
+    if url == NOTICE_FALLBACK_URL:
+        lines.append("이벤트 게시판에서 제목으로 찾으세요.")
+    lines += ["", datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")]
     return "\n".join(lines)
 
 
@@ -763,13 +861,14 @@ def run_once(cfg, state, dry_run=False, skip_cgv=False):
     # 열린 날짜만 보는 지점은 특별관 현황을 조회할 필요가 없다. 그 지점을
     # 보는 대상이 전부 날짜 감시면 게이트 요청이 2건에서 1건으로 줄어든다.
     scan_sites = {t["site_no"] for t in cfg["targets"]
-                  if granularity_of(t) not in ("date", "listing")}
+                  if granularity_of(t) not in ("date", "listing", "notice")}
 
     # 전국 예매 목록 감시. 지점과 무관하고 사이클당 형식(전체/특별관)마다
     # 요청 1건이다. CGV 에서 '제목' 을 볼 수 있는 유일하게 안 막힌 길이라,
     # 어느 지점인지는 몰라도 "그 영화 예매가 열렸다" 는 사실은 제목으로
     # 확인해준다. 특별관 목록(format)은 같은 주소에 attrCd 를 붙여 부른다.
     listing = [t for t in cfg["targets"] if granularity_of(t) == "listing"]
+    listing_called = False    # 이번 주기에 예매 목록을 실제로 불렀나
     if listing:
         jobs = []         # (대상, attrCd 또는 None=전체 목록)
         for t in listing:
@@ -804,6 +903,7 @@ def run_once(cfg, state, dry_run=False, skip_cgv=False):
                 if i:
                     cgv_api._jitter()
                 name = LISTING_FORMAT_NAMES.get(attr, attr) if attr else "전체"
+                listing_called = True
                 try:
                     results[attr] = (cgv_api.get_now_playing() if attr is None
                                      else cgv_api.get_format_listing(attr))
@@ -828,9 +928,7 @@ def run_once(cfg, state, dry_run=False, skip_cgv=False):
             playing = results[attr]
             tid = target_id(target)
             new_target = tid not in baselined
-            label = describe(target)
-            if attr:
-                label += " [{}]".format(LISTING_FORMAT_NAMES.get(attr, attr))
+            label = describe(target)   # 형식 이름은 describe 에 들어 있다
             keyword = target.get("movie_keyword", "")
             fresh = {}
             for m in playing:
@@ -863,6 +961,7 @@ def run_once(cfg, state, dry_run=False, skip_cgv=False):
                 # 대조한다 (평소 주기의 요청은 늘리지 않는다).
                 if full_list is None and not full_tried and not listing_halted:
                     full_tried = True
+                    listing_called = True
                     cgv_api._jitter()
                     try:
                         full_list = cgv_api.get_now_playing()
@@ -888,16 +987,114 @@ def run_once(cfg, state, dry_run=False, skip_cgv=False):
             for key, m in sorted(fresh.items()):
                 log("  {}: '{}' 올라옴".format(label, m.get("movNm")))
                 messages.append((
-                    build_listing_message(m.get("movNm"), m.get("atktRate")),
+                    build_listing_message(
+                        m.get("movNm"), m.get("atktRate"),
+                        LISTING_FORMAT_NAMES.get(attr, attr) if attr else None),
                     [key],
                     [[{"text": "\U0001F39F CGV 예매 페이지", "url": BOOK_URL}]]))
+
+    # CGV 이벤트 게시판 공고 감시. 지점과 무관하고 사이클당 요청 1건이다.
+    # 예매 오픈 공고는 대개 예매가 실제로 열리기 전에 올라온다.
+    notices = []
+    for t in cfg["targets"]:
+        if granularity_of(t) != "notice":
+            continue
+        if not normalize(t.get("movie_keyword", "")) and not any(
+                normalize(k) for k in keywords_of(t)):
+            # 그대로 두면 모든 이벤트 글을 알리게 된다.
+            log("  {}: movie_keyword 와 keywords 가 둘 다 비어 있음 — 건너뜀".format(
+                describe(t)))
+            continue
+        notices.append(t)
+    if notices:
+        posts = None      # None 이면 이번 주기에는 목록이 없다 (기준선도 안 잡는다)
+        if "공고" in waiting:
+            blocked["공고"] = "403 뒤 재시도 대기 중"
+            log("  공고: 재시도 대기 ({}까지)".format(
+                waiting["공고"].strftime("%H:%M")))
+        elif skip_cgv:
+            if "공고" in prev_blocked:
+                blocked["공고"] = "CGV 조회 간격 대기 (직전 403)"
+            log("  공고: CGV 조회 간격 대기")
+        else:
+            if listing_called:
+                cgv_api._jitter()
+            for i, count in enumerate((NOTICE_COUNT, NOTICE_FALLBACK_COUNT)):
+                if i:
+                    cgv_api._jitter()
+                try:
+                    posts, total = cgv_api.get_event_list(count)
+                except chains.BLOCKED_ERRORS as exc:
+                    blocked["공고"] = exc
+                    retry_at["공고"] = backoff_until
+                    log("  공고({}건): 403 — {}까지 쉽니다".format(
+                        count, backoff_until.strftime("%H:%M")))
+                    break
+                except cgv_api.CgvError as exc:
+                    # 300 이 거절됐을 수 있다. 실측된 건수로 한 번만 다시 받는다.
+                    log("  공고({}건): 조회 실패 — {}".format(count, exc))
+                    continue
+                retry_at.pop("공고", None)
+                want = NOTICE_COUNT if total is None else min(total, NOTICE_COUNT)
+                if total is not None and len(posts) < want:
+                    log("  경고: 공고 목록이 잘려 왔습니다 ({}건 중 {}건)."
+                        " 뒤쪽 글은 이번에 보지 못합니다".format(total, len(posts)))
+                break
+        if posts is not None:
+            announced = set()     # 대상 둘이 같은 글을 맞추면 한 번만 알린다
+            # 기준선 글은 모든 대상을 본 뒤에 seen 에 넣는다. 바로 넣으면 앞쪽
+            # 새 대상의 기준선이 뒤쪽 기존 대상의 진짜 새 글을 삼킨다.
+            baseline_keys = set()
+            for target in notices:
+                tid = target_id(target)
+                new_target = tid not in baselined
+                label = describe(target)
+                keyword = target.get("movie_keyword", "")
+                words = [k for k in keywords_of(target) if normalize(k)]
+                fresh = {}
+                for post in posts:
+                    if not isinstance(post, dict):
+                        continue
+                    title = post.get("evntNm")
+                    if not matches(title, keyword):
+                        continue
+                    if words and not any(matches(title, k) for k in words):
+                        continue
+                    key = notice_key(post)
+                    if key is None:
+                        continue
+                    if key not in seen:
+                        fresh[key] = post
+                # 0건이어도 기준선은 잡은 것으로 친다. 아직 안 올라온 공고를
+                # 기다리는 게 이 감시의 목적이다.
+                baselined.add(tid)
+                if not fresh:
+                    log("  {}: 새 공고 없음".format(label))
+                    continue
+                if (first_run or new_target) and not cfg.get("notify_on_first_run", False):
+                    log("    {}이라 {}건을 기준선으로만 저장: {}".format(
+                        "첫 실행" if first_run else "새 대상", len(fresh),
+                        ", ".join(str(p.get("evntNm")) for p in fresh.values())))
+                    baseline_keys.update(fresh)
+                    continue
+                for key, post in sorted(fresh.items()):
+                    if key in announced:
+                        continue
+                    announced.add(key)
+                    log("  {}: '{}' 올라옴".format(label, post.get("evntNm")))
+                    messages.append((
+                        build_notice_message(post),
+                        [key],
+                        [[{"text": "\U0001F4E2 CGV 공고 보기",
+                           "url": notice_url(post)}]]))
+            seen.update(baseline_keys)
 
     force_scan = full_scan_due(cfg, state)
     if force_scan:
         state["last_full_scan"] = datetime.now(KST).isoformat(timespec="seconds")
 
     for target in cfg["targets"]:
-        if granularity_of(target) == "listing":
+        if granularity_of(target) in ("listing", "notice"):
             continue          # 지점이 없는 대상. 위에서 이미 처리했다.
         site_no = target["site_no"]
         site_nm = target.get("site_nm", site_no)
@@ -1158,6 +1355,11 @@ def check_summary():
     lines = []
     for target in cfg["targets"]:
         unit = granularity_of(target)
+        if unit == "notice":
+            # 지점이 없는 대상이다. site_no 를 읽기 전에 처리해야 한다.
+            lines.append("{} — CGV 이벤트 게시판 (여기서는 조회하지 않음)".format(
+                describe(target)))
+            continue
         if unit == "listing":
             lines.append("{} — 전국 예매 목록".format(describe(target)))
             continue
