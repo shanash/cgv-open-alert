@@ -1,13 +1,6 @@
 {
   "targets": [
     {
-      "site_no": "0059",
-      "site_nm": "영등포타임스퀘어",
-      "screen": "SCREENX",
-      "movie_keyword": "어벤져스",
-      "notify": "schedule"
-    },
-    {
       "site_no": "MB1351",
       "site_nm": "코엑스",
       "screen": "돌비시네마",
@@ -42,6 +35,7 @@
   "notify_on_first_run": false,
   "block_warn_hours": 24,
   "block_backoff_minutes": 15,
+  "cgv_interval_minutes": 5,
   "quiet_hours": {
     "start": 1,
     "end": 7,
