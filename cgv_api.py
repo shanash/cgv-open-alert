@@ -194,6 +194,35 @@ def get_now_playing():
     return _get("booking/searchAtktTopPostrList") or []
 
 
+def get_format_listing(attr_cd):
+    """특별관 형식(attrCd)별 예매 목록. 항목 모양은 get_now_playing 과 같다.
+
+    2026-11-27 실측: 같은 경로에 div=CUST_EXPO_MOVTYP_CD&attrCd=04(IMAX)
+    는 4편, 08(SCREENX) 은 4편이 왔고 둘 다 전체 목록(175편)의 진부분집합,
+    서로 다른 목록이었다. 즉 필터가 실제로 걸린다.
+    [{movNo: '30001790', movNm: '듄-파트 3', atktRate: '39.48', ...}, ...]
+    """
+    return _get("booking/searchAtktTopPostrList",
+                div="CUST_EXPO_MOVTYP_CD", attrCd=attr_cd) or []
+
+
+def get_event_list(count):
+    """CGV 이벤트 게시판 목록(진행 중) 앞에서 count 건.
+
+    2026-11-27 실측: data 는 dict 로
+    {startRow, listCount, skipCount, totalCount(235), orderBy, list: [...]}.
+    list 항목은 {evntNo: '202611241728', evntNm: 제목,
+    evntStartDt/evntEndDt: 'YYYY-MM-DD HH:MM:SS', prty, ordtmExpoYn,
+    evntLnkUrl(대부분 None), ...}. 최신순이 아니라 prty(운영자 지정 순서) 순이다.
+    """
+    data = _get("content/event/evt/evt/searchEvtListForPage",
+                sscnsChoiYn="N", expnYn="N", expoChnlCd="01",
+                startRow=0, listCount=count)
+    if isinstance(data, dict):
+        return data.get("list") or []
+    return data or []
+
+
 # ---------------------------------------------------------------- 헬퍼
 
 def has_imax(site_no):

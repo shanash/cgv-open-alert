@@ -1603,6 +1603,218 @@ def test_cgv_interval(fake):
         cgv_api.get_now_playing = saved_np
 
 
+def test_format_listing(fake):
+    """특별관(SCREENX 등) 예매 목록에 영화가 새로 뜨면 알린다."""
+    print("\n[31] 특별관 예매 목록 감시")
+    fake.reset()
+
+    def mov(no, nm, rate="1.0"):
+        return {"movNo": no, "movNm": nm, "atktRate": rate}
+
+    plain = {"site_no": "CGV", "screen": "아이맥스",
+             "movie_keyword": "어벤져스", "notify": "listing"}
+    plain_nosite = {"notify": "listing", "movie_keyword": "어벤져스"}
+    scx = {"notify": "listing", "movie_keyword": "어벤져스", "format": "SCREENX"}
+    odd = {"notify": "listing", "movie_keyword": "어벤져스", "format": "울트라 4K"}
+
+    # ---- 식별자
+    check("형식 없는 대상의 id 는 예전 그대로",
+          watcher.target_id(plain_nosite) == "CGV|아이맥스|어벤져스|listing",
+          watcher.target_id(plain_nosite))
+    check("SCREENX 대상의 id 끝에 attrCd 가 붙는다",
+          watcher.target_id(scx) == "CGV|아이맥스|어벤져스|listing|08",
+          watcher.target_id(scx))
+    try:
+        odd_id = watcher.target_id(odd)
+        ok = odd_id.startswith("CGV|아이맥스|어벤져스|listing|?")
+    except Exception as exc:   # noqa: BLE001
+        odd_id, ok = repr(exc), False
+    check("모르는 형식도 예외 없이 '?' id 가 된다", ok, odd_id)
+    check("형식 이름은 대소문자·공백·한글 별칭을 가린다",
+          [watcher.format_of({"format": f}) for f in
+           ("ScreenX", "스크린X", "IMAX", "아이맥스", "4DX", "Dolby Atmos", "돌비")]
+          == ["08", "08", "04", "04", "03", "06", "06"])
+    check("형식이 없거나 비면 None",
+          watcher.format_of({}) is None and watcher.format_of({"format": ""}) is None)
+    check("listing_key 형식 없으면 예전 모양",
+          watcher.listing_key("30001790", "어벤져스") == "L2|30001790")
+    check("listing_key 형식 있으면 L2|attr|movNo",
+          watcher.listing_key("30001790", "어벤져스", "08") == "L2|08|30001790")
+    check("prune_seen 이 특별관 목록 키를 남긴다",
+          "L2|08|x" in watcher.prune_seen({"L2|08|x", "L2|y"}))
+    check("notice 단위를 그대로 돌려준다",
+          watcher.granularity_of({"notify": "notice"}) == "notice")
+    check("notice id 에 정렬·정규화한 keywords 가 붙는다",
+          watcher.target_id({"notify": "notice", "movie_keyword": "어벤져스",
+                             "keywords": ["예매 오픈", "SCREENX"]})
+          .endswith("|notice|screenx,예매오픈"))
+
+    # ---- run_once
+    full_calls, fmt_calls = [], []
+    full = [mov("1", "듄-파트 3", "39.4"), mov("2", "폭설", "10.2"),
+            mov("3", "명탐정 코난", "1.3")]
+    scxl = [mov("3", "명탐정 코난", "1.3")]
+    errors = {}
+
+    def fake_full():
+        full_calls.append(1)
+        if "full" in errors:
+            raise errors["full"]
+        return list(full)
+
+    def fake_fmt(attr):
+        fmt_calls.append(attr)
+        if "fmt" in errors:
+            raise errors["fmt"]
+        return list(scxl)
+
+    saved = (cgv_api.get_now_playing, cgv_api.get_format_listing)
+    cgv_api.get_now_playing, cgv_api.get_format_listing = fake_full, fake_fmt
+
+    def counts():
+        n = (len(full_calls), len(fmt_calls))
+        full_calls.clear()
+        fmt_calls.clear()
+        return n
+
+    try:
+        cfg = config(scx)
+        msgs, st = run(cfg, fresh_state())
+        check("기준선 주기에는 알리지 않는다", not msgs, msgs)
+        check("형식 목록 조회 인자가 '08'", fmt_calls == ["08"], fmt_calls)
+        check("기준선 주기에는 전체 목록을 부르지 않는다",
+              counts() == (0, 1))
+        # 기준선 주기에 어벤져스가 이미 형식 목록에 있어도 대조하지 않는다
+        scxl.append(mov("8", "어벤져스: 에이지 오브 울트론", "0.2"))
+        msgs_b, _st_b = run(cfg, fresh_state())
+        check("기준선 주기에는 맞는 영화가 있어도 전체 목록을 부르지 않는다",
+              not msgs_b and counts() == (0, 1))
+        scxl.pop()
+
+        msgs, st = run(cfg, st)
+        check("변화 없으면 조용하다", not msgs, msgs)
+        check("평소 주기 요청은 형식당 1건", counts() == (0, 1))
+
+        # 어벤져스가 SCREENX 목록에 뜬다
+        avg = mov("9", "어벤져스: 둠스데이", "2.1")
+        full.append(avg)
+        scxl.append(avg)
+        msgs, st = run(cfg, st)
+        check("SCREENX 목록에 뜨면 한 번 알린다", len(msgs) == 1, msgs)
+        check("알림에 제목이 들어간다",
+              msgs and "어벤져스: 둠스데이" in msgs[0][0], msgs and msgs[0][0])
+        check("알림 키는 L2|08|movNo",
+              msgs and msgs[0][1] == ["L2|08|9"], msgs and msgs[0][1])
+        check("알림 주기에만 전체 목록을 1건 부른다", counts() == (1, 1))
+        msgs, st = run(cfg, st)
+        check("두 번 알리지 않는다", not msgs, msgs)
+        counts()
+
+        # 전체 목록에만 뜬 다른 어벤져스는 SCREENX 대상이 알리지 않는다
+        full.append(mov("10", "어벤져스: 시크릿 워즈", "0.5"))
+        msgs, st = run(cfg, st)
+        check("전체 목록에만 뜨면 SCREENX 대상은 조용하다", not msgs, msgs)
+        counts()
+
+        # CGV 가 필터를 무시해 전체 목록과 같은 목록을 준다
+        st_ignored = copy.deepcopy(st)
+        scxl[:] = list(full) + [mov("11", "어벤져스: 엔드게임 재개봉", "0.3")]
+        full.append(mov("11", "어벤져스: 엔드게임 재개봉", "0.3"))
+        msgs, st_ignored = run(cfg, st_ignored)
+        check("형식 목록이 전체 목록과 같으면 알리지 않는다", not msgs, msgs)
+        check("필터 무시 판정 뒤 seen 에 넣지 않는다",
+              "L2|08|11" not in st_ignored["seen"], st_ignored["seen"])
+        counts()
+        full.pop()
+        scxl[:] = [mov("3", "명탐정 코난", "1.3"), avg]
+
+        # 대조용 전체 목록이 403 이면 보류하고 백오프
+        scxl.append(mov("12", "어벤져스: 인피니티 워", "0.7"))
+        errors["full"] = cgv_api.CloudflareBlocked("403 Forbidden: 예매목록")
+        msgs, st = run(cfg, st)
+        # 403 경고 메시지는 따로 나간다. 영화 알림만 본다.
+        check("대조용 전체 목록이 403 이면 알림을 보류한다",
+              not [m for m in msgs if "어벤져스" in m[0]], msgs)
+        check("보류한 영화는 seen 에 넣지 않는다",
+              "L2|08|12" not in st["seen"], st["seen"])
+        check("'예매목록' 백오프가 적힌다",
+              "예매목록" in (st.get("blocked_until") or {}),
+              st.get("blocked_until"))
+        check("차단으로 기록된다", st.get("blocked") is True)
+        counts()
+        del errors["full"]
+
+        msgs, st = run(cfg, st)
+        check("대기 중에는 형식 목록도 부르지 않는다", counts() == (0, 0))
+        check("대기 중에는 알리지 않는다", not msgs, msgs)
+
+        st["blocked_until"] = {}
+        msgs, st = run(cfg, st)
+        check("대기가 풀리면 보류했던 영화를 알린다",
+              len(msgs) == 1 and "인피니티 워" in msgs[0][0], msgs)
+        counts()
+
+        # 형식 목록 403 이면 남은 목록을 부르지 않는다
+        both = config(plain_nosite, scx,
+                      {"notify": "listing", "movie_keyword": "어벤져스",
+                       "format": "IMAX"})
+        ids = [watcher.target_id(t) for t in both["targets"]]
+        base = dict(fresh_state(), initialized=True, baselined=ids,
+                    seen=list(st["seen"]))
+        errors["fmt"] = cgv_api.CloudflareBlocked("403 Forbidden: 형식")
+        msgs, st2 = run(both, copy.deepcopy(base))
+        check("형식 목록 403 이면 남은 형식 목록을 부르지 않는다",
+              fmt_calls == ["04"], fmt_calls)
+        check("전체 목록은 먼저 1건 부른다", full_calls == [1], full_calls)
+        check("형식 목록 403 도 '예매목록' 백오프",
+              "예매목록" in (st2.get("blocked_until") or {}))
+        counts()
+        del errors["fmt"]
+
+        # 403 아닌 실패: 다른 지점 감시(가짜 메가박스)는 돌고 state 가 돌아온다
+        errors["fmt"] = cgv_api.CgvError("searchAtktTopPostrList: 서버 오류")
+        mb = {"site_no": "MB7011", "site_nm": "동대구", "screen": "ALL",
+              "movie_keyword": "듄", "notify": "schedule"}
+        saved_mb = (megabox_api.get_gate, megabox_api.get_schedules)
+        megabox_api.get_gate = lambda site: {"screens": {}, "dates": [D1]}
+        megabox_api.get_schedules = lambda site, ymd: [
+            row("MB7011", "D9", "듄: 파트 3", D1, "1900")]
+        try:
+            cfg3 = config(scx, mb)
+            st3 = dict(fresh_state(), initialized=True,
+                       baselined=[watcher.target_id(mb), watcher.target_id(scx)])
+            try:
+                msgs, st3 = watcher.run_once(cfg3, st3, dry_run=True)
+                ok = True
+            except Exception as exc:   # noqa: BLE001
+                msgs, ok = [], repr(exc)
+            check("형식 목록 CgvError 여도 run_once 가 끝난다", ok is True, ok)
+            check("형식 목록 CgvError 여도 메가박스 알림은 나간다",
+                  any("듄" in m[0] for m in msgs), [m[0][:40] for m in msgs])
+            check("CgvError 는 차단으로 치지 않는다",
+                  "예매목록" not in (st3.get("blocked_until") or {}),
+                  st3.get("blocked_until"))
+        finally:
+            megabox_api.get_gate, megabox_api.get_schedules = saved_mb
+        counts()
+        del errors["fmt"]
+
+        # 모르는 형식은 조회 없이 건너뛴다
+        msgs, st4 = run(config(odd), fresh_state())
+        check("모르는 형식 대상은 조회하지 않는다", counts() == (0, 0))
+        check("모르는 형식 대상은 기준선도 잡지 않는다",
+              watcher.target_id(odd) not in st4.get("baselined", []),
+              st4.get("baselined"))
+
+        # skip_cgv 주기에는 형식 목록을 부르지 않는다
+        _m, _st = watcher.run_once(cfg, copy.deepcopy(st), dry_run=True,
+                                   skip_cgv=True)
+        check("CGV 를 건너뛰는 주기에는 형식 목록도 부르지 않는다",
+              counts() == (0, 0))
+    finally:
+        cgv_api.get_now_playing, cgv_api.get_format_listing = saved
+
+
 def main():
     fake = FakeCgv().install()
     try:
@@ -1636,6 +1848,7 @@ def main():
         test_listing_watch(fake)
         test_block_backoff(fake)
         test_cgv_interval(fake)
+        test_format_listing(fake)
     finally:
         fake.restore()
 

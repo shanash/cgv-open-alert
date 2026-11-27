@@ -66,6 +66,20 @@ SCREEN_ALL = "ALL"
 # 사용자가 어떻게 적든 각 극장사의 상영관 표기로 맞춘다. chains 가 갖는다.
 SCREEN_ALIASES = dict(chains.SCREEN_ALIASES)
 
+# 예매 목록 감시(listing)의 특별관 필터. normalize 한 이름 -> CGV attrCd.
+# screen 과 따로 두는 이유: screen_of() 의 기본값이 '아이맥스' 라 전체 목록과
+# IMAX 목록이 같은 id 가 되고, '돌비' 별칭은 메가박스 돌비시네마로 풀린다.
+LISTING_FORMATS = {
+    "imax": "04", "아이맥스": "04",
+    "4dx": "03",
+    "screenx": "08", "스크린x": "08",
+    "dolbyatmos": "06", "돌비": "06", "돌비애트모스": "06",
+}
+# attrCd -> 표시 이름
+LISTING_FORMAT_NAMES = {
+    "04": "IMAX", "03": "4DX", "08": "SCREENX", "06": "DOLBY ATMOS",
+}
+
 DEFAULT_CONFIG = {
     "targets": [],
     "full_scan_every_minutes": 30,
@@ -225,9 +239,22 @@ def granularity_of(target):
     시간표 주소가 403 으로 막혀 있어도 '그 날짜가 열렸나'는 알 수 있다.
     """
     notify = target.get("notify")
-    if notify in ("date", "screen", "listing"):
+    if notify in ("date", "screen", "listing", "notice"):
         return notify
     return "movie" if notify == "movie" else "schedule"
+
+
+def format_of(target):
+    """예매 목록 대상의 특별관 attrCd. 없으면 None (전체 목록).
+
+    모르는 값은 '?' + 정규화한 값을 돌려준다. 예외를 던지면 안 된다.
+    merge_state 가 target_id 를 거쳐 이 함수를 부른다.
+    """
+    raw = target.get("format")
+    if not raw:
+        return None
+    key = normalize(str(raw))
+    return LISTING_FORMATS.get(key, "?" + key)
 
 
 def watch_dates_of(target):
@@ -250,6 +277,14 @@ def target_id(target):
         normalize(target.get("movie_keyword", "")), granularity_of(target))
     if granularity_of(target) == "date":
         base += "|" + ",".join(sorted(watch_dates_of(target)))
+    elif granularity_of(target) == "listing":
+        # 형식이 없는 대상은 예전 id 그대로 둔다. 바뀌면 기준선을 다시 잡는다.
+        attr = format_of(target)
+        if attr is not None:
+            base += "|" + attr
+    elif granularity_of(target) == "notice":
+        base += "|" + ",".join(sorted(
+            normalize(k) for k in (target.get("keywords") or [])))
     return base
 
 
@@ -384,14 +419,20 @@ def date_key(site_no, ymd):
     return "D|{}|{}".format(site_no, ymd)
 
 
-def listing_key(mov_no, mov_nm):
+def listing_key(mov_no, mov_nm, attr=None):
     """예매 목록 키. 영화번호가 있으면 그걸 쓰고 없으면 제목으로.
 
     접두어가 'L2|' 인 이유: 예전 'L|' 키는 예매 전(개봉예정) 영화까지
     기준선으로 저장했을 수 있다. merge_state 가 seen 을 원격과 합집합으로
     합치므로 코드에서 지워도 되살아난다. 그래서 새 접두어로 옛 기록을
     무시한다. 옛 'L|' 키는 손대지 않는다.
+
+    특별관 목록(attr)은 'L2|<attrCd>|<영화>' 로 따로 센다. 같은 영화가
+    전체 목록에서 이미 알려졌어도 SCREENX 목록에 처음 뜨면 따로 알린다.
+    3조각이지만 'D|' 가 아니라서 prune_seen 이 지우지 않는다.
     """
+    if attr:
+        return "L2|{}|{}".format(attr, mov_no or normalize(mov_nm))
     return "L2|{}".format(mov_no or normalize(mov_nm))
 
 
@@ -724,35 +765,72 @@ def run_once(cfg, state, dry_run=False, skip_cgv=False):
     scan_sites = {t["site_no"] for t in cfg["targets"]
                   if granularity_of(t) not in ("date", "listing")}
 
-    # 전국 예매 목록 감시. 지점과 무관하고 사이클당 요청 1건이다.
-    # CGV 에서 '제목' 을 볼 수 있는 유일하게 안 막힌 길이라, 어느 지점인지는
-    # 몰라도 "그 영화 예매가 열렸다" 는 사실은 제목으로 확인해준다.
+    # 전국 예매 목록 감시. 지점과 무관하고 사이클당 형식(전체/특별관)마다
+    # 요청 1건이다. CGV 에서 '제목' 을 볼 수 있는 유일하게 안 막힌 길이라,
+    # 어느 지점인지는 몰라도 "그 영화 예매가 열렸다" 는 사실은 제목으로
+    # 확인해준다. 특별관 목록(format)은 같은 주소에 attrCd 를 붙여 부른다.
     listing = [t for t in cfg["targets"] if granularity_of(t) == "listing"]
     if listing:
+        jobs = []         # (대상, attrCd 또는 None=전체 목록)
+        for t in listing:
+            attr = format_of(t)
+            if attr is not None and attr.startswith("?"):
+                # 모르는 형식은 조회도, 기준선도 하지 않는다.
+                log("  {}: 모르는 특별관 형식 '{}' — 건너뜀".format(
+                    describe(t), t.get("format")))
+                continue
+            if t.get("screen"):
+                log("  {}: 예매 목록 감시는 screen 을 쓰지 않습니다 — 무시"
+                    " (특별관은 format 으로 지정)".format(describe(t)))
+            jobs.append((t, attr))
+        # 전체 목록을 먼저 부른다. 그래야 대조용으로 따로 부를 일이 준다.
+        wanted = sorted({a for _t, a in jobs},
+                        key=lambda a: (a is not None, a or ""))
+        results = {}      # attr -> 목록. 못 불렀거나 실패한 attr 는 없다.
+        full_tried = None in wanted
+        listing_halted = False    # 403·대기로 이번 주기엔 더 부르지 않는다
         if "예매목록" in waiting:
             blocked["예매목록"] = "403 뒤 재시도 대기 중"
-            playing = None
+            listing_halted = True
             log("  예매 목록: 재시도 대기 ({}까지)".format(
                 waiting["예매목록"].strftime("%H:%M")))
         elif skip_cgv:
             if "예매목록" in prev_blocked:
                 blocked["예매목록"] = "CGV 조회 간격 대기 (직전 403)"
-            playing = None
+            listing_halted = True
             log("  예매 목록: CGV 조회 간격 대기")
         else:
-            try:
-                playing = cgv_api.get_now_playing()
+            for i, attr in enumerate(wanted):
+                if i:
+                    cgv_api._jitter()
+                name = LISTING_FORMAT_NAMES.get(attr, attr) if attr else "전체"
+                try:
+                    results[attr] = (cgv_api.get_now_playing() if attr is None
+                                     else cgv_api.get_format_listing(attr))
+                except chains.BLOCKED_ERRORS as exc:
+                    # Cloudflare 는 매개변수가 아니라 클라이언트를 본다.
+                    # 하나가 막히면 나머지도 막히므로 더 두드리지 않는다.
+                    blocked["예매목록"] = exc
+                    retry_at["예매목록"] = backoff_until
+                    listing_halted = True
+                    log("  예매 목록({}): 403 — {}까지 쉽니다".format(
+                        name, backoff_until.strftime("%H:%M")))
+                    break
+                except cgv_api.CgvError as exc:
+                    # 이 형식만 결과 없음으로 둔다. 다른 감시는 계속 돈다.
+                    log("  예매 목록({}): 조회 실패 — {}".format(name, exc))
+            if not listing_halted:
                 retry_at.pop("예매목록", None)
-            except chains.BLOCKED_ERRORS as exc:
-                blocked["예매목록"] = exc
-                retry_at["예매목록"] = backoff_until
-                playing = None
-                log("  예매 목록: 403 — {}까지 쉽니다".format(
-                    backoff_until.strftime("%H:%M")))
-        for target in (listing if playing is not None else []):
+        full_list = results.get(None)
+        for target, attr in jobs:
+            if attr not in results:
+                continue      # 못 불렀거나 실패. 빈 목록으로 기준선을 잡지 않는다.
+            playing = results[attr]
             tid = target_id(target)
             new_target = tid not in baselined
             label = describe(target)
+            if attr:
+                label += " [{}]".format(LISTING_FORMAT_NAMES.get(attr, attr))
             keyword = target.get("movie_keyword", "")
             fresh = {}
             for m in playing:
@@ -764,7 +842,7 @@ def run_once(cfg, state, dry_run=False, skip_cgv=False):
                     log("  {}: '{}' 예매 전(개봉예정) — 건너뜀".format(
                         label, m.get("movNm")))
                     continue
-                key = listing_key(m.get("movNo"), m.get("movNm"))
+                key = listing_key(m.get("movNo"), m.get("movNm"), attr)
                 if key not in seen:
                     fresh[key] = m
             # 0건이어도 기준선은 잡은 것으로 친다. 아직 안 올라온 영화를
@@ -779,6 +857,34 @@ def run_once(cfg, state, dry_run=False, skip_cgv=False):
                     ", ".join(str(m.get("movNm")) for m in fresh.values())))
                 seen.update(fresh)
                 continue
+            if attr:
+                # CGV 가 attrCd 를 무시하고 전체 목록을 주면 일반 예매 오픈을
+                # 특별관 오픈으로 잘못 알린다. 알리기 직전에만 전체 목록과
+                # 대조한다 (평소 주기의 요청은 늘리지 않는다).
+                if full_list is None and not full_tried and not listing_halted:
+                    full_tried = True
+                    cgv_api._jitter()
+                    try:
+                        full_list = cgv_api.get_now_playing()
+                    except chains.BLOCKED_ERRORS as exc:
+                        blocked["예매목록"] = exc
+                        retry_at["예매목록"] = backoff_until
+                        listing_halted = True
+                        log("  예매 목록(전체, 대조용): 403 — {}까지 쉽니다".format(
+                            backoff_until.strftime("%H:%M")))
+                    except cgv_api.CgvError as exc:
+                        log("  예매 목록(전체, 대조용): 조회 실패 — {}".format(exc))
+                if full_list is None:
+                    # seen 에 넣지 않으므로 다음 주기에 다시 판단한다.
+                    log("  {}: 대조할 전체 목록이 없어 알림 보류 ({}건)".format(
+                        label, len(fresh)))
+                    continue
+                fmt_nos = {m.get("movNo") for m in playing}
+                if fmt_nos and fmt_nos == {m.get("movNo") for m in full_list}:
+                    log("  경고: {} 목록이 전체 목록과 같습니다. CGV 가 특별관"
+                        " 필터를 무시한 것 같아 알리지 않습니다".format(
+                            LISTING_FORMAT_NAMES.get(attr, attr)))
+                    continue
             for key, m in sorted(fresh.items()):
                 log("  {}: '{}' 올라옴".format(label, m.get("movNm")))
                 messages.append((
