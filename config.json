@@ -6,6 +6,13 @@
       "screen": "SCREENX",
       "movie_keyword": "어벤져스",
       "notify": "schedule"
+    },
+    {
+      "site_no": "MB1351",
+      "site_nm": "코엑스",
+      "screen": "돌비시네마",
+      "movie_keyword": "어벤져스",
+      "notify": "schedule"
     }
   ],
   "full_scan_every_minutes": 30,
