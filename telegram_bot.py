@@ -208,7 +208,7 @@ def verify_movie(keyword):
     titles = [m["movNm"] for m in movies]
     hits = [
         {"movNm": m["movNm"],
-         "upcoming": not m.get("atktRate") or m["atktRate"] == "0"}
+         "upcoming": watcher.is_upcoming(m)}
         for m in movies if watcher.matches(m["movNm"], keyword)
     ]
     if hits:

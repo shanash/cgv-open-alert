@@ -358,8 +358,24 @@ def date_key(site_no, ymd):
 
 
 def listing_key(mov_no, mov_nm):
-    """예매 목록 키. 영화번호가 있으면 그걸 쓰고 없으면 제목으로."""
-    return "L|{}".format(mov_no or normalize(mov_nm))
+    """예매 목록 키. 영화번호가 있으면 그걸 쓰고 없으면 제목으로.
+
+    접두어가 'L2|' 인 이유: 예전 'L|' 키는 예매 전(개봉예정) 영화까지
+    기준선으로 저장했을 수 있다. merge_state 가 seen 을 원격과 합집합으로
+    합치므로 코드에서 지워도 되살아난다. 그래서 새 접두어로 옛 기록을
+    무시한다. 옛 'L|' 키는 손대지 않는다.
+    """
+    return "L2|{}".format(mov_no or normalize(mov_nm))
+
+
+def is_upcoming(movie):
+    """예매 목록의 영화가 아직 예매 전(개봉예정)인지.
+
+    예매 전 영화는 atktRate(예매율)가 비어 있다 (개발노트.md 86-88행 실측).
+    빈 값/없음 또는 정확히 "0" 이면 예매 전으로 본다. "0.00" 은 막 예매가
+    열린 영화일 수 있으므로 예매 중으로 본다.
+    """
+    return not movie.get("atktRate") or movie.get("atktRate") == "0"
 
 
 def screen_key(site_no, screen, count):
@@ -703,6 +719,12 @@ def run_once(cfg, state, dry_run=False):
             fresh = {}
             for m in playing:
                 if not keyword or not matches(m.get("movNm"), keyword):
+                    continue
+                # 예매 전 영화는 알리지도, 기준선으로 저장하지도 않는다.
+                # 예매율이 생기는 사이클에 처음 보는 영화로 잡혀 한 번 알린다.
+                if is_upcoming(m):
+                    log("  {}: '{}' 예매 전(개봉예정) — 건너뜀".format(
+                        label, m.get("movNm")))
                     continue
                 key = listing_key(m.get("movNo"), m.get("movNm"))
                 if key not in seen:

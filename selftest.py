@@ -1402,6 +1402,51 @@ def test_listing_watch(fake):
         msgs, state = run(cfg, state)
         check("찾는 영화가 아니면 조용하다", not msgs, msgs)
 
+        # 예매 전(개봉예정) 영화는 예매율이 비어 있다. 실제로 예매가 열리는
+        # 순간에 한 번 알려야 한다. 예전에는 예매 전 상태로 기준선에 들어가
+        # 정작 열릴 때 알림이 안 왔다.
+        check("예매 전 판정: 없음/빈 값/'0' 은 예매 전",
+              all(watcher.is_upcoming(m) for m in
+                  ({}, {"atktRate": ""}, {"atktRate": "0"})))
+        check("예매 전 판정: '0.00'/'2.94' 는 예매 중",
+              not any(watcher.is_upcoming({"atktRate": r})
+                      for r in ("0.00", "2.94")))
+
+        avg = {"notify": "listing", "movie_keyword": "어벤져스"}
+        avg_cfg = config(avg)
+        avg_key = watcher.listing_key("30001790", "어벤져스: 둠스데이")
+        avg_now = [mov("30001790", "어벤져스: 둠스데이", "")]
+        cgv_api.get_now_playing = lambda: list(avg_now)
+        msgs, st = run(avg_cfg, fresh_state())
+        check("첫 실행: 예매 전 영화는 알리지 않는다", not msgs, msgs)
+        check("첫 실행: 예매 전 영화는 기준선으로 저장하지 않는다",
+              avg_key not in st["seen"], st["seen"])
+        check("첫 실행: 대상 기준선은 잡힌다",
+              watcher.target_id(avg) in st.get("baselined", []),
+              st.get("baselined"))
+
+        msgs, st = run(avg_cfg, st)
+        check("다음 실행: 예매율이 비어 있으면 조용하다", not msgs, msgs)
+        avg_now[0] = mov("30001790", "어벤져스: 둠스데이", "0")
+        msgs, st = run(avg_cfg, st)
+        check("다음 실행: 예매율이 '0' 이면 조용하다", not msgs, msgs)
+
+        avg_now[0] = mov("30001790", "어벤져스: 둠스데이", "1.2")
+        msgs, st = run(avg_cfg, st)
+        check("예매가 열리면 한 번 알린다", len(msgs) == 1, msgs)
+        check("열림 알림에 제목이 들어간다",
+              msgs and "어벤져스: 둠스데이" in msgs[0][0], msgs and msgs[0][0])
+        msgs, st = run(avg_cfg, st)
+        check("열린 뒤에는 조용하다", not msgs, msgs)
+
+        # 옛 'L|' 키가 남아 있어도 알림을 막지 않는다
+        st = dict(fresh_state(), initialized=True,
+                  seen=["L|30001790"], baselined=[watcher.target_id(avg)])
+        msgs, st = run(avg_cfg, st)
+        check("옛 'L|' 기록이 있어도 예매가 열리면 알린다",
+              len(msgs) == 1, msgs)
+        cgv_api.get_now_playing = lambda: list(now)
+
         # 403 이어도 다른 감시는 돈다
         cgv_api.get_now_playing = lambda: (_ for _ in ()).throw(
             cgv_api.CloudflareBlocked("403 Forbidden: 예매목록"))
