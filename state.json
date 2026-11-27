@@ -9,7 +9,9 @@
   "blocked_sites": [
     "0059"
   ],
-  "blocked_until": {},
+  "blocked_until": {
+    "0059": "2026-11-27T20:25:20+09:00"
+  },
   "gates": {
     "0059": {
       "dates": [
@@ -35,7 +37,7 @@
       ],
       "screens": {
         "4DX": "3",
-        "DOLBY ATMOS": "8",
+        "DOLBY ATMOS": "7",
         "SCREENX": "3",
         "골드클래스": "2",
         "아이맥스": "3"
@@ -73,8 +75,8 @@
   "initialized": true,
   "last_block_warn": 1795705054.9148512,
   "last_full_scan": "2026-11-27T19:55:22+09:00",
-  "last_run": "2026-11-27T20:08:37+09:00",
-  "run_no": 82025,
+  "last_run": "2026-11-27T20:13:39+09:00",
+  "run_no": 82029,
   "screen_counts": {},
   "seen": [
     "D|0089|20261205",
