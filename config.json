@@ -13,6 +13,10 @@
       "screen": "돌비시네마",
       "movie_keyword": "어벤져스",
       "notify": "schedule"
+    },
+    {
+      "notify": "listing",
+      "movie_keyword": "어벤져스"
     }
   ],
   "full_scan_every_minutes": 30,
